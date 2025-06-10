@@ -1,551 +1,495 @@
-﻿Function Initialize-HawkGlobalObject {
+Function Initialize-HawkGlobalObject {
     <#
     .SYNOPSIS
-        Create global variable $Hawk for use by all Hawk cmdlets.
+        Initializes the Hawk global object with authentication and configuration settings.
+
     .DESCRIPTION
-        Creates the global variable $Hawk and populates it with information needed by the other Hawk cmdlets.
+        Initialize-HawkGlobalObject sets up the global Hawk object that contains authentication details,
+        configuration settings, and other data used by Hawk investigation functions.
+        
+        This function now supports both interactive authentication and Azure app registration authentication
+        for automated/scripted scenarios commonly used in SOC environments.
 
-        * Checks for latest version of the Hawk module
-        * Creates path for output files
-        * Records target start and end dates for searches (in UTC)
     .PARAMETER Force
-        Switch to force the function to run and allow the variable to be recreated
-    .PARAMETER SkipUpdate
-        Skips checking for the latest version of the Hawk Module
-    .PARAMETER DaysToLookBack
-        Defines the # of days to look back in the availible logs.
-        Valid values are 1-90
-    .PARAMETER StartDate
-        First day that data will be retrieved (in UTC)
-    .PARAMETER EndDate
-        Last day that data will be retrieved (in UTC)
+        Switch to force re-initialization even if a global object already exists.
+
     .PARAMETER FilePath
-        Provide an output file path.
-    .PARAMETER NonInteractive
-    Switch to run the command in non-interactive mode. Requires all necessary parameters
-    to be provided via command line rather than through interactive prompts.
-    .OUTPUTS
-        Creates the $Hawk global variable and populates it with a custom PS object with the following properties
+        Specifies the output directory for investigation files.
+        Default is the current working directory.
 
-        Property Name	Contents
-        ==========		==========
-        FilePath		Path to output files
-        DaysToLookBack	Number of day back in time we are searching
-        StartDate		Calculated start date for searches based on DaysToLookBack (UTC)
-        EndDate			One day in the future (UTC)
-        WhenCreated		Date and time that the variable was created (UTC)
+    .PARAMETER Encoding
+        Specifies the encoding for output files.
+        Valid values: ASCII, UTF8, UTF7, UTF32, Unicode, BigEndianUnicode, Default, OEM
+        Default is UTF8.
+
+    .PARAMETER VerboseLogging
+        Switch to enable verbose logging output.
+
+    .PARAMETER SkipTenantConnection
+        Switch to skip establishing tenant-level connections.
+        Useful when only performing user-specific investigations.
+
+    .PARAMETER SkipExchangeConnection
+        Switch to skip establishing Exchange Online connections.
+        Note: This will limit the data that can be collected.
+
+    .PARAMETER SkipAzureConnection
+        Switch to skip establishing Azure AD/Entra ID connections.
+        Note: This will limit the data that can be collected.
+
+    .PARAMETER UseAppAuthentication
+        Switch to use Azure app registration authentication instead of interactive authentication.
+        When enabled, requires TenantId, ClientId, and ClientSecret parameters.
+
+    .PARAMETER TenantId
+        Azure tenant ID (GUID) for app authentication.
+        Required when UseAppAuthentication is specified.
+
+    .PARAMETER ClientId
+        Azure app registration client ID (GUID) for app authentication.
+        Required when UseAppAuthentication is specified.
+
+    .PARAMETER ClientSecret
+        Azure app registration client secret for app authentication.
+        Required when UseAppAuthentication is specified.
+        Should be passed as a SecureString for security.
+
+    .PARAMETER CertificateThumbprint
+        Certificate thumbprint for certificate-based app authentication.
+        Alternative to ClientSecret for app authentication.
+
+    .PARAMETER Scopes
+        Array of Microsoft Graph scopes to request during authentication.
+        Default scopes include common permissions needed for Hawk investigations.
+
     .EXAMPLE
-        Initialize-HawkGlobalObject -Force
+        Initialize-HawkGlobalObject
+        
+        Initializes Hawk with interactive authentication (original behavior).
 
-        This Command will force the creation of a new $Hawk variable even if one already exists.
+    .EXAMPLE
+        Initialize-HawkGlobalObject -UseAppAuthentication -TenantId "12345678-1234-1234-1234-123456789012" -ClientId "87654321-4321-4321-4321-210987654321" -ClientSecret $SecureSecret
+        
+        Initializes Hawk using Azure app registration authentication for automated scenarios.
+
+    .EXAMPLE
+        $SecretString = ConvertTo-SecureString "your-client-secret" -AsPlainText -Force
+        Initialize-HawkGlobalObject -UseAppAuthentication -TenantId "tenant-guid" -ClientId "client-guid" -ClientSecret $SecretString -FilePath "C:\HawkOutput"
+        
+        Initializes Hawk with app authentication and specifies output directory.
+
+    .EXAMPLE
+        Initialize-HawkGlobalObject -UseAppAuthentication -TenantId "tenant-guid" -ClientId "client-guid" -CertificateThumbprint "ABC123..." -VerboseLogging
+        
+        Initializes Hawk using certificate-based app authentication with verbose logging.
+
+    .NOTES
+        For app authentication, ensure your Azure app registration has the following permissions:
+        - AuditLog.Read.All
+        - Directory.Read.All
+        - Reports.Read.All
+        - User.Read.All
+        - Mail.Read
+        - SecurityEvents.Read.All
+        
+        Author: Modified for SOC automation scenarios
+        Version: Enhanced for Azure App Authentication
     #>
-    [CmdletBinding()]
-    param
-    (
-        [DateTime]$StartDate,
-        [DateTime]$EndDate,
-        [int]$DaysToLookBack,
-        [string]$FilePath,
-        [switch]$SkipUpdate,
-        [switch]$NonInteractive,
-        [switch]$Force
+
+    [CmdletBinding(DefaultParameterSetName = 'Interactive')]
+    param(
+        [switch]$Force,
+        
+        [string]$FilePath = (Get-Location).Path,
+        
+        [ValidateSet('ASCII', 'UTF8', 'UTF7', 'UTF32', 'Unicode', 'BigEndianUnicode', 'Default', 'OEM')]
+        [string]$Encoding = 'UTF8',
+        
+        [switch]$VerboseLogging,
+        
+        [switch]$SkipTenantConnection,
+        
+        [switch]$SkipExchangeConnection,
+        
+        [switch]$SkipAzureConnection,
+        
+        # App Authentication Parameters
+        [Parameter(ParameterSetName = 'AppAuth')]
+        [switch]$UseAppAuthentication,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'AppAuth')]
+        [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+        [string]$TenantId,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'AppAuth')]
+        [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+        [string]$ClientId,
+        
+        [Parameter(ParameterSetName = 'AppAuth')]
+        [SecureString]$ClientSecret,
+        
+        [Parameter(ParameterSetName = 'AppAuth')]
+        [string]$CertificateThumbprint,
+        
+        [string[]]$Scopes = @(
+            'AuditLog.Read.All',
+            'Directory.Read.All', 
+            'Reports.Read.All',
+            'User.Read.All',
+            'Mail.Read',
+            'SecurityEvents.Read.All',
+            'Organization.Read.All'
+        )
     )
 
-
-    if ($Force) {
-        Remove-Variable -Name Hawk -Scope Global -ErrorAction SilentlyContinue
-    }
-
-    # Check for incomplete/interrupted initialization and force a fresh start
-    if ($null -ne (Get-Variable -Name Hawk -ErrorAction SilentlyContinue)) {
-        if (Test-HawkGlobalObject) {
-            Remove-Variable -Name Hawk -Scope Global -ErrorAction SilentlyContinue
-
-            # Remove other related global variables that might exist
-            Remove-Variable -Name IPlocationCache -Scope Global -ErrorAction SilentlyContinue
-            Remove-Variable -Name MSFTIPList -Scope Global -ErrorAction SilentlyContinue
-        }
-    }
-
-    Function Test-LoggingPath {
-        param([string]$PathToTest)
-
-        # Get the current timestamp in the format yyyy-MM-dd HH:mm:ssZ
-        $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss'Z'")
-
-        # First test if the path we were given exists
-        if (Test-Path $PathToTest) {
-            # If the path exists verify that it is a folder
-            if ((Get-Item $PathToTest).PSIsContainer -eq $true) {
-                Return $true
+    begin {
+        Write-Host "Initializing Hawk Global Object..." -ForegroundColor Green
+        
+        # Validate app authentication parameters
+        if ($UseAppAuthentication) {
+            if (-not $ClientSecret -and -not $CertificateThumbprint) {
+                throw "When using app authentication, either ClientSecret or CertificateThumbprint must be provided."
             }
-            # If it is not a folder return false and write an error
-            else {
-                Write-Information "[$timestamp] - [ERROR]  - Path provided $PathToTest was not found to be a folder."
-                Return $false
+            
+            if ($ClientSecret -and $CertificateThumbprint) {
+                Write-Warning "Both ClientSecret and CertificateThumbprint provided. Using CertificateThumbprint."
+                $ClientSecret = $null
             }
         }
-        # If it doesn't exist then return false and write an error
-        else {
-            Write-Information "[$timestamp] - [ERROR]  - Directory $PathToTest Not Found"
-            Return $false
-        }
     }
 
-
-    Function New-LoggingFolder {
-        [OutputType([System.Collections.Hashtable])]
-        [CmdletBinding(SupportsShouldProcess)]
-        param([string]$RootPath)
-
-        # Get the current timestamp in the format yyyy-MM-dd HH:mm:ssZ
-        $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss'Z'")
-
+    process {
         try {
-            # Test Graph connection first to see if we're already connected
-            try {
-                $null = Get-MgOrganization -ErrorAction Stop
-                Write-Information "[$timestamp] - [INFO]   - Already connected to Microsoft Graph"
-            }
-            catch {
-                # Only show connecting message if we actually need to connect
-                Write-Information "[$timestamp] - [ACTION] - Connecting to Microsoft Graph"
-                $null = Test-GraphConnection
-                Write-Information "[$timestamp] - [INFO]   - Connected to Microsoft Graph Successfully"
+            # Check if global object exists and handle Force parameter
+            if ($Global:HawkGlobalObject -and -not $Force) {
+                Write-Host "Hawk Global Object already exists. Use -Force to reinitialize." -ForegroundColor Yellow
+                return $Global:HawkGlobalObject
             }
 
-            # Get tenant name
-            $org = Get-MgOrganization -ErrorAction Stop
-            if (!$org) {
-                throw "Could not retrieve tenant organization information"
+            # Initialize the global object
+            $Global:HawkGlobalObject = [PSCustomObject]@{
+                FilePath = $FilePath
+                Encoding = $Encoding
+                VerboseLogging = $VerboseLogging
+                AuthenticationMethod = if ($UseAppAuthentication) { 'AppRegistration' } else { 'Interactive' }
+                TenantId = $TenantId
+                ClientId = $ClientId
+                Scopes = $Scopes
+                StartTime = Get-Date
+                Connections = @{
+                    MicrosoftGraph = $false
+                    ExchangeOnline = $false
+                    AzureAD = $false
+                }
+                OutputDirectory = $null
+                InvestigationName = $null
             }
 
-            # Use display name if available, otherwise fall back to tenant name
-            $TenantName = if ($org.DisplayName) {
-                $org.DisplayName
+            # Create output directory structure
+            $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+            $investigationFolder = "Hawk_Investigation_$timestamp"
+            $outputPath = Join-Path $FilePath $investigationFolder
+            
+            if (-not (Test-Path $outputPath)) {
+                New-Item -Path $outputPath -ItemType Directory -Force | Out-Null
+                Write-Host "Created investigation directory: $outputPath" -ForegroundColor Green
             }
-            else {
-                $org.Id
+            
+            $Global:HawkGlobalObject.OutputDirectory = $outputPath
+            $Global:HawkGlobalObject.InvestigationName = $investigationFolder
+
+            # Authentication Section
+            Write-Host "Establishing connections..." -ForegroundColor Cyan
+
+            # Microsoft Graph Authentication
+            if (-not $SkipAzureConnection) {
+                try {
+                    Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Yellow
+                    
+                    if ($UseAppAuthentication) {
+                        # App Registration Authentication
+                        if ($CertificateThumbprint) {
+                            # Certificate-based authentication
+                            Write-Host "Using certificate-based app authentication..." -ForegroundColor Cyan
+                            Connect-MgGraph -ClientId $ClientId -TenantId $TenantId -CertificateThumbprint $CertificateThumbprint -NoWelcome
+                        }
+                        else {
+                            # Client Secret authentication
+                            Write-Host "Using client secret app authentication..." -ForegroundColor Cyan
+                            $ClientSecretCredential = New-Object System.Management.Automation.PSCredential($ClientId, $ClientSecret)
+                            Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $ClientSecretCredential -NoWelcome
+                        }
+                    }
+                    else {
+                        # Interactive Authentication (original behavior)
+                        Write-Host "Using interactive authentication..." -ForegroundColor Cyan
+                        Connect-MgGraph -Scopes $Scopes -NoWelcome
+                    }
+                    
+                    # Verify connection
+                    $context = Get-MgContext
+                    if ($context) {
+                        $Global:HawkGlobalObject.Connections.MicrosoftGraph = $true
+                        $Global:HawkGlobalObject.TenantId = $context.TenantId
+                        Write-Host "✓ Microsoft Graph connected successfully" -ForegroundColor Green
+                        Write-Host "  Tenant: $($context.TenantId)" -ForegroundColor Gray
+                        Write-Host "  Account: $($context.Account)" -ForegroundColor Gray
+                        Write-Host "  Scopes: $($context.Scopes -join ', ')" -ForegroundColor Gray
+                    }
+                }
+                catch {
+                    Write-Error "Failed to connect to Microsoft Graph: $($_.Exception.Message)"
+                    $Global:HawkGlobalObject.Connections.MicrosoftGraph = $false
+                }
             }
 
-            # Remove any invalid file system characters and spaces
-            $TenantName = $TenantName -replace '[\\/:*?"<>|]', '' -replace '\s+', '_'
-
-            [string]$FolderID = "Hawk_" + $TenantName + "_" + (Get-Date).ToUniversalTime().ToString("yyyyMMdd_HHmmss")
-
-            $FullOutputPath = Join-Path $RootPath $FolderID
-
-            if (Test-Path $FullOutputPath) {
-                Write-Information "[$timestamp] - [ERROR]  - Path $FullOutputPath already exists"
+            # Exchange Online Authentication (if Graph connection successful and not skipped)
+            if ($Global:HawkGlobalObject.Connections.MicrosoftGraph -and -not $SkipExchangeConnection) {
+                try {
+                    Write-Host "Connecting to Exchange Online..." -ForegroundColor Yellow
+                    
+                    if ($UseAppAuthentication) {
+                        # For app authentication, use the same credentials for Exchange Online
+                        if ($CertificateThumbprint) {
+                            Connect-ExchangeOnline -CertificateThumbprint $CertificateThumbprint -AppId $ClientId -Organization $TenantId -ShowProgress:$false
+                        }
+                        else {
+                            # Note: Exchange Online with client secret requires specific setup
+                            Write-Warning "Exchange Online with client secret requires certificate-based authentication. Skipping Exchange Online connection."
+                            $Global:HawkGlobalObject.Connections.ExchangeOnline = $false
+                        }
+                    }
+                    else {
+                        # Interactive authentication for Exchange Online
+                        Connect-ExchangeOnline -ShowProgress:$false
+                    }
+                    
+                    # Verify Exchange Online connection
+                    $exoSession = Get-PSSession | Where-Object { $_.ConfigurationName -eq 'Microsoft.Exchange' -and $_.State -eq 'Opened' }
+                    if ($exoSession) {
+                        $Global:HawkGlobalObject.Connections.ExchangeOnline = $true
+                        Write-Host "✓ Exchange Online connected successfully" -ForegroundColor Green
+                    }
+                }
+                catch {
+                    Write-Warning "Failed to connect to Exchange Online: $($_.Exception.Message)"
+                    $Global:HawkGlobalObject.Connections.ExchangeOnline = $false
+                }
             }
-            else {
-                Write-Information "[$timestamp] - [ACTION] - Creating subfolder $FullOutputPath"
-                $null = New-Item $FullOutputPath -ItemType Directory -ErrorAction Stop
-            }
 
-            # Return both path and tenant name
-            return @{
-                Path       = $FullOutputPath
-                TenantName = $TenantName
-            }
+            # Log connection summary
+            Write-Host "`nConnection Summary:" -ForegroundColor Cyan
+            Write-Host "  Microsoft Graph: $(if($Global:HawkGlobalObject.Connections.MicrosoftGraph){'✓ Connected'}else{'✗ Not Connected'})" -ForegroundColor $(if($Global:HawkGlobalObject.Connections.MicrosoftGraph){'Green'}else{'Red'})
+            Write-Host "  Exchange Online: $(if($Global:HawkGlobalObject.Connections.ExchangeOnline){'✓ Connected'}else{'✗ Not Connected'})" -ForegroundColor $(if($Global:HawkGlobalObject.Connections.ExchangeOnline){'Green'}else{'Red'})
 
+            # Create log file
+            $logFile = Join-Path $outputPath "HawkInitialization.log"
+            $logEntry = @"
+Hawk Investigation Initialized: $(Get-Date)
+Authentication Method: $($Global:HawkGlobalObject.AuthenticationMethod)
+Tenant ID: $($Global:HawkGlobalObject.TenantId)
+Output Directory: $($Global:HawkGlobalObject.OutputDirectory)
+Microsoft Graph Connected: $($Global:HawkGlobalObject.Connections.MicrosoftGraph)
+Exchange Online Connected: $($Global:HawkGlobalObject.Connections.ExchangeOnline)
+"@
+            $logEntry | Out-File -FilePath $logFile -Encoding UTF8
+
+            Write-Host "`nHawk Global Object initialized successfully!" -ForegroundColor Green
+            Write-Host "Investigation directory: $outputPath" -ForegroundColor Gray
+            
+            return $Global:HawkGlobalObject
         }
         catch {
-            # If it fails at any point, display an error message
-            Write-Error "[$timestamp] - [ERROR]  - Failed to create logging folder: $_"
+            Write-Error "Failed to initialize Hawk Global Object: $($_.Exception.Message)"
+            throw
         }
     }
 
-    Function Set-LoggingPath {
-        [CmdletBinding(SupportsShouldProcess)]
-        param (
-            [string]$Path)
-
-        # Get the current timestamp in the format yyyy-MM-dd HH:mm:ssZ
-        $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss'Z'")
-
-        # If no value for Path is provided, prompt and gather from the user
-        if ([string]::IsNullOrEmpty($Path)) {
-            # Setup a while loop to get a valid path
-            Do {
-                # Ask the user for the output path
-                [string]$UserPath = (Read-Host "[$timestamp] - [PROMPT] - Please provide an output directory").Trim()
-
-                # If the input is null or empty, prompt again
-                if ([string]::IsNullOrEmpty($UserPath)) {
-                    Write-Host "[$timestamp] - [INFO]   - Directory path cannot be empty. Please enter in a new path."
-                    $ValidPath = $false
-                }
-                # If the path is valid, create the subfolder
-                elseif (Test-LoggingPath -PathToTest $UserPath) {
-                    $folderInfo = New-LoggingFolder -RootPath $UserPath
-                    $ValidPath = $true
-                }
-                # If the path is invalid, prompt again
-                else {
-                    Write-Information "[$timestamp] - [ERROR]  - Path not a valid directory: $UserPath"
-                    $ValidPath = $false
-                }
-            }
-            While ($ValidPath -eq $false)
-        }
-        # If a value for Path is provided, validate it
-        else {
-            # If the provided path is valid, create the subfolder
-            if (Test-LoggingPath -PathToTest $Path) {
-                $folderInfo = New-LoggingFolder -RootPath $Path  # Changed variable name for clarity
-            }
-            # If the provided path fails validation, stop the process
-            else {
-                Write-Error "[$timestamp] - [ERROR]  - Provided path is not a valid directory: $Path"
-            }
-        }
-
-        Return $folderInfo
-    }
-    Function New-ApplicationInsight {
-        [CmdletBinding(SupportsShouldProcess)]
-        param()
-        # Initialize Application Insights client
-        $insightkey = "aa3d4e74-29c0-4b4c-83ad-865669402baa"
-        if ($Null -eq $Client) {
-            Out-LogFile "Initializing Application Insights" -Action
-            $Client = New-AIClient -key $insightkey
+    end {
+        if ($VerboseLogging) {
+            Write-Host "`nHawk Global Object Details:" -ForegroundColor Cyan
+            $Global:HawkGlobalObject | Format-List
         }
     }
+}
 
-    ### Main ###
-    $InformationPreference = "Continue"
-
-
-    if (($null -eq (Get-Variable -Name Hawk -ErrorAction SilentlyContinue)) -or ($Force -eq $true) -or ($null -eq $Hawk)) {
-
-        if ($NonInteractive) {
-            Write-HawkBanner
+# Helper function to validate and retrieve stored credentials (for SOC automation scenarios)
+Function Get-HawkStoredCredentials {
+    <#
+    .SYNOPSIS
+        Retrieves stored Azure app credentials for Hawk investigations.
+    
+    .DESCRIPTION
+        Helper function to securely retrieve stored Azure app registration credentials
+        from various sources like Azure Key Vault, Windows Credential Manager, or
+        environment variables for automated SOC workflows.
+    
+    .PARAMETER Source
+        Source of the stored credentials: 'KeyVault', 'CredentialManager', 'Environment'
+    
+    .PARAMETER KeyVaultName
+        Name of the Azure Key Vault (when using KeyVault source)
+    
+    .PARAMETER SecretName
+        Name of the secret containing the client secret
+    
+    .EXAMPLE
+        $creds = Get-HawkStoredCredentials -Source 'Environment'
+        Initialize-HawkGlobalObject -UseAppAuthentication -TenantId $creds.TenantId -ClientId $creds.ClientId -ClientSecret $creds.ClientSecret
+    #>
+    
+    [CmdletBinding()]
+    param(
+        [ValidateSet('KeyVault', 'CredentialManager', 'Environment')]
+        [string]$Source = 'Environment',
+        
+        [string]$KeyVaultName,
+        [string]$SecretName = 'HawkClientSecret'
+    )
+    
+    switch ($Source) {
+        'Environment' {
+            $tenantId = $env:HAWK_TENANT_ID
+            $clientId = $env:HAWK_CLIENT_ID
+            $clientSecret = $env:HAWK_CLIENT_SECRET
+            
+            if ($clientSecret) {
+                $secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+            }
+            
+            return @{
+                TenantId = $tenantId
+                ClientId = $clientId
+                ClientSecret = $secureSecret
+            }
         }
-        else {
-            Write-HawkBanner -DisplayWelcomeMessage
-        }
-
-
-
-        # Create the global $Hawk variable immediately with minimal properties
-        $Global:Hawk = [PSCustomObject]@{
-            FilePath       = $null  # Will be set shortly
-            DaysToLookBack = $null
-            StartDate      = $null
-            EndDate        = $null
-            WhenCreated    = $null
-            TenantName     = $null
-        }
-
-        # Set up the file path first, before any other operations
-        # Set up the file path first, before any other operations
-        if ([string]::IsNullOrEmpty($FilePath)) {
-            # Suppress Graph connection output during initial path setup
-            $folderInfo = Set-LoggingPath -ErrorAction Stop
-            $Hawk.FilePath = $folderInfo.Path
-            $Hawk.TenantName = $folderInfo.TenantName
-        }
-        else {
-            $folderInfo = Set-LoggingPath -path $FilePath -ErrorAction Stop 2>$null
-            $Hawk.FilePath = $folderInfo.Path
-            $Hawk.TenantName = $folderInfo.TenantName
-        }
-
-        # Now that FilePath is set, we can use Out-LogFile
-        Out-LogFile "Hawk output directory created at: $($Hawk.FilePath)" -Information
-
-        # Setup Application insights
-        Out-LogFile "Setting up Application Insights" -Action
-        New-ApplicationInsight
-
-        ### Checking for Updates ###
-        # If we are skipping the update log it
-        if ($SkipUpdate) {
-            Out-LogFile -string "Skipping Update Check" -Information
-        }
-        # Check to see if there is an Update for Hawk
-        else {
-            Update-HawkModule
-        }
-
-        # Test Graph connection
-        Out-LogFile "Testing Graph Connection" -Action
-
-        Test-GraphConnection
-
-
-        if (-not $NonInteractive) {
+        
+        'CredentialManager' {
+            # Implementation for Windows Credential Manager
+            # Requires CredentialManager PowerShell module
             try {
-                $LicenseInfo = Test-LicenseType
-                $MaxDaysToGoBack = $LicenseInfo.RetentionPeriod
-                $LicenseType = $LicenseInfo.LicenseType
-
-                Out-LogFile -string "Detecting M365 license type to determine maximum log retention period" -action
-                Out-LogFile -string "M365 License type detected: $LicenseType" -Information
-                Out-LogFile -string "Max log retention: $MaxDaysToGoBack days" -action -NoNewLine
-
+                $storedCred = Get-StoredCredential -Target "HawkAzureApp"
+                return @{
+                    TenantId = $env:HAWK_TENANT_ID
+                    ClientId = $storedCred.UserName
+                    ClientSecret = $storedCred.Password
+                }
             }
             catch {
-                Out-LogFile -string "Failed to detect license type. Max days of log retention is unknown." -Information
-                $MaxDaysToGoBack = 90
-                $LicenseType = "Unknown"
-            }
-
-        }
-
-
-        # Ensure MaxDaysToGoBack does not exceed 365 days
-        if ($MaxDaysToGoBack -gt 365) { $MaxDaysToGoBack = 365 }
-
-        # Start date validation: Add check for negative numbers
-        while ($null -eq $StartDate) {
-            Write-Output "`n"
-            Out-LogFile "Please specify the first day of the search window:" -isPrompt
-            Out-LogFile " Enter a number of days to go back (1-$MaxDaysToGoBack)" -isPrompt
-            Out-LogFile " OR enter a date in MM/DD/YYYY format" -isPrompt
-            Out-LogFile " Default is 90 days back: " -isPrompt -NoNewLine
-            [string]$StartRead = (Read-Host).Trim()
-
-            # Determine if input is a valid date
-            # Determine if input is a valid date
-            if ($null -eq ($StartRead -as [DateTime])) {
-
-                #### Not a DateTime => interpret as # of days ####
-                if ([string]::IsNullOrEmpty($StartRead)) {
-                    $StartRead = "90"
-                }
-
-                # First check if it's a valid integer without converting
-                if (-not ($StartRead -match '^\d+$')) {
-                    Out-LogFile -string "Invalid input. Please enter a number between 1 and 365, or a date in MM/DD/YYYY format." -isError
-                    continue
-                }
-
-                # Now safe to convert to integer since we validated the format
-                [int]$StartRead = [int]$StartRead
-
-                $StartDays = $StartRead
-
-                # Validate the input is within range
-                # Validate the input is within range
-                if (($StartRead -gt 365) -or ($StartRead -lt 1))   {
-                    Out-LogFile -string "Days to go back must be between 1 and 365." -isError
-                    Remove-Variable -Name StartDate -ErrorAction SilentlyContinue
-                    continue
-                }
-
-
-                # Validate the entered days back
-                if ($StartRead -gt $MaxDaysToGoBack) {
-                    Out-LogFile -string "The date entered exceeds your license retention period of $MaxDaysToGoBack days." -isWarning
-                    Out-LogFile "Press ENTER to proceed or type 'R' to re-enter the date:" -isPrompt -NoNewLine
-                    $Proceed = (Read-Host).Trim()
-                    if ($Proceed -eq 'R') { Remove-Variable -Name StartDate -ErrorAction SilentlyContinue; continue }
-                }
-
-
-                # At this point, we do not yet have EndDate set. So temporarily anchor from "today":
-                [DateTime]$StartDate = ((Get-Date).ToUniversalTime().AddDays(-$StartRead)).Date
-
-                Out-LogFile -string "Start date set to: ${StartDate}Z" -Information
-
-            }
-            elseif (!($null -eq ($StartRead -as [DateTime]))) {
-                [DateTime]$StartDate = $StartRead -as [DateTime]  # <--- Add this line
-
-                # ========== The user entered a DateTime, so $StartDays stays 0 ==========
-                # Validate the date
-                if ($StartDate -gt (Get-Date).ToUniversalTime()) {
-                    Out-LogFile -string "Start date cannot be in the future." -isError
-                    Remove-Variable -Name StartDate -ErrorAction SilentlyContinue
-                    continue
-                }
-
-                if ($StartDate -lt ((Get-Date).ToUniversalTime().AddDays(-$MaxDaysToGoBack))) {
-                    Out-LogFile -string "The date entered exceeds your license retention period of $MaxDaysToGoBack days." -isWarning
-                    Out-LogFile "Press ENTER to proceed or type 'R' to re-enter the date:" -isPrompt -NoNewLine
-                    $Proceed = (Read-Host).Trim()
-                    if ($Proceed -eq 'R') { Remove-Variable -Name StartDate -ErrorAction SilentlyContinue; continue }
-                }
-
-
-                if ($StartDate -lt ((Get-Date).ToUniversalTime().AddDays(-365))) {
-                    Out-LogFile -string "The date cannot exceed 365 days. Setting to the maximum limit of 365 days." -isWarning
-                    [DateTime]$StartDate = ((Get-Date).ToUniversalTime().AddDays(-365)).Date
-
-                }
-
-                Out-LogFile -string "Start Date: ${StartDate}Z" -Information
-            }
-            else {
-                Out-LogFile -string "Invalid date information provided. Could not determine if this was a date or an integer." -isError
-                $StartDate = $null
-                continue
+                Write-Error "Failed to retrieve credentials from Credential Manager: $($_.Exception.Message)"
             }
         }
-
-        # End date logic with enhanced validation
-        while ($null -eq $EndDate) {
-            Write-Output ""
-            Out-LogFile "Please specify the last day of the search window:" -isPrompt
-            Out-LogFile " Enter a number of days to go back from today (1-365)" -isPrompt
-            Out-LogFile " OR enter a specific date in MM/DD/YYYY format" -isPrompt
-            Out-LogFile " Default is today's date:" -isPrompt -NoNewLine
-            $EndRead = (Read-Host).Trim()
-
-            # End date validation
-            if ($null -eq ($EndRead -as [DateTime])) {
-                if ([string]::IsNullOrEmpty($EndRead)) {
-                    [DateTime]$tempEndDate = (Get-Date).ToUniversalTime().Date
+        
+        'KeyVault' {
+            # Implementation for Azure Key Vault
+            # Requires Az.KeyVault module
+            try {
+                $secret = Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name $SecretName
+                return @{
+                    TenantId = $env:HAWK_TENANT_ID
+                    ClientId = $env:HAWK_CLIENT_ID
+                    ClientSecret = $secret.SecretValue
                 }
-                else {
-                    # Validate input is a positive number
-                    if ($EndRead -match '^\-') {
-                        Out-LogFile -string "Please enter a positive number of days." -isError
-                        continue
-                    }
-                    # Validate numeric value
-                    if ($EndRead -notmatch '^\d+$') {
-                        Out-LogFile -string "Invalid input. Please enter a number between 1 and 365, or a date in MM/DD/YYYY format." -isError
-                        continue
-                    }
-                    Out-LogFile -string "End Date: $EndRead days." -Information
-                    [DateTime]$tempEndDate = ((Get-Date).ToUniversalTime().AddDays( - ($EndRead - 1))).Date
-                }
-
-                if ($StartDate -gt $tempEndDate) {
-                    Out-LogFile -string "End date must be more recent than start date ($StartDate)" -isError
-                    continue
-                }
-
-                # --- FINAL FIX: Always move to next day at 00:00 UTC ---
-                $tempEndDate = $tempEndDate.ToUniversalTime().Date.AddDays(1)
-
-                $EndDate = $tempEndDate
-                # Write-Output ""
-                # Out-LogFile -string "End date set to: ${EndDate}Z`n" -Information
             }
-            elseif (!($null -eq ($EndRead -as [DateTime]))) {
-
-                [DateTime]$tempEndDate = (Get-Date $EndRead).ToUniversalTime().Date
-
-                if ($StartDate -gt $tempEndDate) {
-                    Out-LogFile -string "End date must be more recent than start date ($StartDate)." -isError
-                    continue
-                }
-                elseif ($tempEndDate -gt ((Get-Date).ToUniversalTime().AddDays(1))) {
-                    Out-LogFile -string "EndDate too far in the future. Setting EndDate to today." -isWarning
-                    $tempEndDate = (Get-Date).ToUniversalTime().Date
-                }
-
-                # --- FINAL FIX: Always move to next day at 00:00 UTC ---
-                $tempEndDate = $tempEndDate.ToUniversalTime().Date.AddDays(1)
-
-                $EndDate = $tempEndDate
-                # Out-LogFile -string "End date set to: ${EndDate}Z`n" -Information
-            }
-            else {
-                Out-LogFile -string "Invalid date information provided. Could not determine if this was a date or an integer." -isError
-                continue
+            catch {
+                Write-Error "Failed to retrieve credentials from Key Vault: $($_.Exception.Message)"
             }
         }
-
-        # End date logic remains unchanged except for final +1 day fix
-        if ($null -eq $EndDate) {
-            Out-LogFile "Please specify the last day of the search window:" -isPrompt
-            Out-LogFile " Enter a number of days to go back from today (1-365)" -isPrompt
-            Out-LogFile " OR enter a specific date in MM/DD/YYYY format" -isPrompt
-            Out-LogFile " Default is today's date:" -isPrompt -NoNewLine
-            $EndRead = (Read-Host).Trim()
-
-            # End date validation
-            if ($null -eq ($EndRead -as [DateTime])) {
-                if ([string]::IsNullOrEmpty($EndRead)) {
-                    [DateTime]$EndDate = (Get-Date).ToUniversalTime().Date
-                }
-                else {
-                    Out-LogFile -string "End Date: $EndRead days." -Information
-                    [DateTime]$EndDate = ((Get-Date).ToUniversalTime().AddDays( - ($EndRead - 1))).Date
-                }
-
-                if ($StartDate -gt $EndDate) {
-                    Out-LogFile -string "StartDate cannot be more recent than EndDate" -isError
-                }
-                else {
-                    # --- FINAL FIX: Always move to next day at 00:00 UTC ---
-                    $EndDate = $EndDate.ToUniversalTime().Date.AddDays(1)
-
-                    # Write-Output ""
-                    # Out-LogFile -string "End date set to: ${EndDate}Z`n" -Information
-                }
-            }
-            elseif (!($null -eq ($EndRead -as [DateTime]))) {
-                [DateTime]$EndDate = (Get-Date $EndRead).ToUniversalTime().Date
-
-                if ($StartDate -gt $EndDate) {
-                    Out-LogFile -string "EndDate is earlier than StartDate. Setting EndDate to today." -isWarning
-                    [DateTime]$EndDate = (Get-Date).ToUniversalTime().Date
-                }
-                elseif ($EndDate -gt ((Get-Date).ToUniversalTime().AddDays(1))) {
-                    Out-LogFile -string "EndDate too far in the future. Setting EndDate to today." -isWarning
-                    [DateTime]$EndDate = (Get-Date).ToUniversalTime().Date
-                }
-
-                # --- FINAL FIX: Always move to next day at 00:00 UTC ---
-                $EndDate = $EndDate.ToUniversalTime().Date.AddDays(1)
-
-                # Out-LogFile -string "End date set to: ${EndDate}Z`n" -Information
-            }
-            else {
-                Out-LogFile -string "Invalid date information provided. Could not determine if this was a date or an integer." -isError
-            }
-        }
-
-        # --- AFTER the EndDate block, do a final check to "re-anchor" StartDate if it was given in days ---
-        if ($StartDays -gt 0) {
-            # Recalculate StartDate based on EndDate = $EndDate and StartDays = $StartDays
-            Out-LogFile -string "End date set to midnight UTC of next day to include all data from $($EndDate.AddDays(-1).Date.ToString('yyyy-MM-dd'))Z" -Information
-            $StartDate = $EndDate.AddDays(-1).AddDays(-$StartDays).Date
-
-            # (Optional) Additional validations again if necessary:
-            if ($StartDate -gt (Get-Date).ToUniversalTime()) {
-                Out-LogFile -string "Start date is in the future. Resetting to today's date." -isWarning
-                $StartDate = (Get-Date).ToUniversalTime().Date
-            }
-
-            # If EndDate is today, adjust to current time
-            if ($EndDate.Date -eq (Get-Date).Date) {
-                $EndDate = (Get-Date).ToUniversalTime()
-                Out-LogFile -string "Adjusting EndDate to current time: $EndDate" -Information
-            }
-
-        }
-
-
-
-        # Configuration Example, currently not used
-        #TODO: Implement Configuration system across entire project
-        Set-PSFConfig -Module 'Hawk' -Name 'DaysToLookBack' -Value $Days -PassThru | Register-PSFConfig
-        if ($OutputPath) {
-            Set-PSFConfig -Module 'Hawk' -Name 'FilePath' -Value $OutputPath -PassThru | Register-PSFConfig
-        }
-
-
-
-
-        # Continue populating the Hawk object with other properties
-        $Hawk.DaysToLookBack = $DaysToLookBack
-        $Hawk.StartDate = $StartDate
-        $Hawk.EndDate = $EndDate
-        $Hawk.WhenCreated = (Get-Date).ToUniversalTime().ToString("g")
-        Write-HawkConfigurationComplete -Hawk $Hawk
-
-
     }
-    else {
-        Out-LogFile -string "Valid Hawk Object already exists no actions will be taken." -Information
-    }
+}
 
+# Example usage function for SOC automation
+Function Start-HawkSOCInvestigation {
+    <#
+    .SYNOPSIS
+        Simplified function for SOC analysts to start Hawk investigations with app authentication.
+    
+    .DESCRIPTION
+        Wrapper function that simplifies the process of starting Hawk investigations
+        in SOC environments using Azure app registration authentication.
+    
+    .PARAMETER TenantId
+        Azure tenant ID
+    
+    .PARAMETER ClientId
+        Azure app registration client ID
+    
+    .PARAMETER ClientSecret
+        Azure app registration client secret (as SecureString)
+    
+    .PARAMETER InvestigationType
+        Type of investigation: 'Tenant', 'User', or 'Both'
+    
+    .PARAMETER UserPrincipalName
+        User to investigate (required when InvestigationType is 'User' or 'Both')
+    
+    .PARAMETER OutputPath
+        Output directory for investigation files
+    
+    .PARAMETER DaysBack
+        Number of days to look back for audit logs (default: 30)
+    
+    .EXAMPLE
+        $secureSecret = ConvertTo-SecureString "your-secret" -AsPlainText -Force
+        Start-HawkSOCInvestigation -TenantId "tenant-guid" -ClientId "client-guid" -ClientSecret $secureSecret -InvestigationType "Tenant"
+    #>
+    
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TenantId,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$ClientId,
+        
+        [Parameter(Mandatory = $true)]
+        [SecureString]$ClientSecret,
+        
+        [ValidateSet('Tenant', 'User', 'Both')]
+        [string]$InvestigationType = 'Tenant',
+        
+        [string]$UserPrincipalName,
+        
+        [string]$OutputPath = "C:\HawkInvestigations",
+        
+        [int]$DaysBack = 30
+    )
+    
+    try {
+        # Initialize Hawk with app authentication
+        Write-Host "Starting SOC investigation with app authentication..." -ForegroundColor Green
+        
+        Initialize-HawkGlobalObject -UseAppAuthentication -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -FilePath $OutputPath -VerboseLogging
+        
+        # Run investigations based on type
+        switch ($InvestigationType) {
+            'Tenant' {
+                Write-Host "Starting tenant investigation..." -ForegroundColor Cyan
+                Start-HawkTenantInvestigation -DaysToLookBack $DaysBack -FilePath $Global:HawkGlobalObject.OutputDirectory
+            }
+            
+            'User' {
+                if (-not $UserPrincipalName) {
+                    throw "UserPrincipalName is required for user investigations"
+                }
+                Write-Host "Starting user investigation for $UserPrincipalName..." -ForegroundColor Cyan
+                Start-HawkUserInvestigation -UserPrincipalName $UserPrincipalName -DaysToLookBack $DaysBack -FilePath $Global:HawkGlobalObject.OutputDirectory
+            }
+            
+            'Both' {
+                if (-not $UserPrincipalName) {
+                    throw "UserPrincipalName is required when InvestigationType is 'Both'"
+                }
+                Write-Host "Starting comprehensive investigation..." -ForegroundColor Cyan
+                Start-HawkTenantInvestigation -DaysToLookBack $DaysBack -FilePath $Global:HawkGlobalObject.OutputDirectory
+                Start-HawkUserInvestigation -UserPrincipalName $UserPrincipalName -DaysToLookBack $DaysBack -FilePath $Global:HawkGlobalObject.OutputDirectory
+            }
+        }
+        
+        Write-Host "Investigation completed. Results saved to: $($Global:HawkGlobalObject.OutputDirectory)" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "SOC investigation failed: $($_.Exception.Message)"
+        throw
+    }
 }
