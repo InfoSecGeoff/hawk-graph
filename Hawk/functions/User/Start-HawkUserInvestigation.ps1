@@ -102,10 +102,32 @@
 		[DateTime]$EndDate,
 		[int]$DaysToLookBack,
 		[string]$FilePath,
-		[switch]$SkipUpdate
+		[switch]$SkipUpdate,
+
+		[Parameter(Mandatory = $false)]
+		[string]$AzureAppCsvPath,
+		
+		[Parameter(Mandatory = $false)]  
+		[string]$AzureAppClientName,
+		
+		[Parameter(Mandatory = $false)]
+		[switch]$UseAzureApp
 	)
 
 	begin {
+		if ($UseAzureApp -or $AzureAppCsvPath -or $AzureAppClientName) {
+			Write-Output "[HAWK] Azure App authentication detected, initializing..."
+			
+			$initParams = @{
+				UseAzureApp = $true
+			}
+			
+			if ($AzureAppCsvPath) { $initParams.AzureAppCsvPath = $AzureAppCsvPath }
+			if ($AzureAppClientName) { $initParams.AzureAppClientName = $AzureAppClientName }
+			if ($NonInteractive) { $initParams.HeadlessMode = $true }
+			
+			Initialize-HawkGlobalObject @initParams
+}
 		$NonInteractive = Test-HawkNonInteractiveMode -PSBoundParameters $PSBoundParameters
 		Send-AIEvent -Event "CmdRun"
 
