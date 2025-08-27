@@ -99,8 +99,13 @@
         [int]$DaysToLookBack,
         [string]$FilePath,
         [switch]$SkipUpdate,
+		[Parameter(Mandatory = $false)]
 		[string]$AzureAppCsvPath,
-  		[string]$AzureAppClientName,
+		
+		[Parameter(Mandatory = $false)]  
+		[string]$AzureAppClientName,
+		
+		[Parameter(Mandatory = $false)]
 		[switch]$UseAzureApp
     )
 
