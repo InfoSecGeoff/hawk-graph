@@ -192,39 +192,63 @@ Function Start-HawkTenantInvestigation {
                     throw "Microsoft Graph connection failed"
                 }
                 
-                # Connect to Exchange Online with client secret (headless)
-                Write-Output "[HAWK] Connecting to Exchange Online with client secret..."
+                # Connect to Exchange Online with access token (headless)
+                Write-Output "[HAWK] Connecting to Exchange Online with access token..."
                 try {
-                    # Determine the correct organization domain
+                    # Get organization domain - try different approaches
                     $organizationDomain = $selectedApp.'Tenant ID'
                     
-                    # Try to get the primary domain from Graph if possible
+                    # Try to get domains without filter (some tenants don't support filtering)
                     try {
-                        $domains = Get-MgDomain -Filter "isInitial eq true"
-                        if ($domains -and $domains.Id) {
-                            $organizationDomain = $domains[0].Id
+                        $allDomains = Get-MgDomain
+                        $primaryDomain = $allDomains | Where-Object { $_.IsInitial -eq $true }
+                        if ($primaryDomain -and $primaryDomain.Id) {
+                            $organizationDomain = $primaryDomain.Id
+                            Write-Output "[HAWK] Using primary domain: $organizationDomain"
+                        } else {
+                            # Fallback to first .onmicrosoft.com domain
+                            $onMicrosoftDomain = $allDomains | Where-Object { $_.Id -like "*.onmicrosoft.com" } | Select-Object -First 1
+                            if ($onMicrosoftDomain) {
+                                $organizationDomain = $onMicrosoftDomain.Id
+                                Write-Output "[HAWK] Using onmicrosoft domain: $organizationDomain"
+                            }
                         }
                     } catch {
-                        # Fallback to using tenant ID
-                        Write-Warning "[HAWK] Could not determine primary domain, using tenant ID"
+                        Write-Warning "[HAWK] Could not retrieve domains, using tenant ID: $($_.Exception.Message)"
                     }
                     
-                    # Connect to Exchange Online using client secret
-                    Connect-ExchangeOnline -AppId $selectedApp.'Client ID' -Organization $organizationDomain -ClientSecretCredential $clientSecretCredential -ShowProgress:$false -ShowBanner:$false -SkipLoadingFormatData:$true
+                    # Get access token for Exchange Online
+                    $tokenUrl = "https://login.microsoftonline.com/$($selectedApp.'Tenant ID')/oauth2/v2.0/token"
+                    $tokenBody = @{
+                        client_id = $selectedApp.'Client ID'
+                        client_secret = $selectedApp.'Key Value'
+                        scope = "https://outlook.office365.com/.default"
+                        grant_type = "client_credentials"
+                    }
                     
-                    # Verify Exchange Online connection
-                    $exoConnectionInfo = Get-ConnectionInformation
-                    if ($exoConnectionInfo) {
-                        Write-Output "[HAWK] Exchange Online connected successfully"
-                        Write-Output "[HAWK]   Organization: $($exoConnectionInfo.Organization)"
-                        Write-Output "[HAWK]   Auth Type: $($exoConnectionInfo.AuthenticationType)"
+                    $tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $tokenBody -ContentType "application/x-www-form-urlencoded"
+                    
+                    if ($tokenResponse.access_token) {
+                        # Connect to Exchange Online using access token
+                        Connect-ExchangeOnline -AppId $selectedApp.'Client ID' -Organization $organizationDomain -AccessToken $tokenResponse.access_token -ShowProgress:$false -ShowBanner:$false -SkipLoadingFormatData:$true
+                        
+                        # Verify Exchange Online connection
+                        $exoConnectionInfo = Get-ConnectionInformation
+                        if ($exoConnectionInfo) {
+                            Write-Output "[HAWK] Exchange Online connected successfully"
+                            Write-Output "[HAWK]   Organization: $($exoConnectionInfo.Organization)"
+                            Write-Output "[HAWK]   Auth Type: $($exoConnectionInfo.AuthenticationType)"
+                        } else {
+                            throw "Exchange Online connection verification failed"
+                        }
                     } else {
-                        throw "Exchange Online connection verification failed"
+                        throw "Failed to obtain Exchange Online access token"
                     }
                     
                 } catch {
                     Write-Warning "[HAWK] Exchange Online connection failed: $($_.Exception.Message)"
                     Write-Output "[HAWK] Continuing with Microsoft Graph only (some data may be limited)..."
+                    Write-Output "[HAWK] Note: Exchange Online requires 'Exchange Administrator' role assigned to the Azure App"
                 }
                 
                 Write-Output "[HAWK] Azure App authentication completed successfully"
@@ -283,8 +307,8 @@ Function Start-HawkTenantInvestigation {
             $validation = Test-HawkInvestigationParameter -StartDate $StartDate -EndDate $EndDate -DaysToLookBack $DaysToLookBack -FilePath $FilePath -NonInteractive
     
             if (-not $validation.IsValid) {
-                foreach ($error in $validation.ErrorMessages) {
-                    Stop-PSFFunction -Message $error -EnableException $true
+                foreach ($validationerror in $validation.ErrorMessages) {
+                    Stop-PSFFunction -Message $validationerror -EnableException $true
                 }
             }
 
