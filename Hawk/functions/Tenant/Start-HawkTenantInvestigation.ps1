@@ -1,4 +1,4 @@
-﻿Function Start-HawkTenantInvestigation {
+Function Start-HawkTenantInvestigation {
     <#
     .SYNOPSIS
         Performs a comprehensive tenant-wide investigation using Hawk's automated data collection capabilities.
@@ -50,6 +50,15 @@
         Useful in automated scenarios or air-gapped environments.
         Providing this parameter automatically enables non-interactive mode.
 
+    .PARAMETER AzureAppCsvPath
+        Path to CSV file containing Azure App credentials for authentication.
+
+    .PARAMETER AzureAppClientName
+        Name of the Azure App client to use from the CSV file.
+
+    .PARAMETER UseAzureApp
+        Switch to enable Azure App authentication mode.
+
     .PARAMETER Confirm
         Prompts you for confirmation before executing each investigation step.
         By default, confirmation prompts appear for operations that could collect sensitive data.
@@ -81,6 +90,11 @@
         Skips the update check. Runs in non-interactive mode because parameters were specified.
 
     .EXAMPLE
+        Start-HawkTenantInvestigation -UseAzureApp -AzureAppCsvPath "C:\creds.csv" -AzureAppClientName "SOC Client" -DaysToLookBack 30 -FilePath "C:\Investigation"
+
+        Runs investigation using Azure App authentication with 30-day lookback.
+
+    .EXAMPLE
         Start-HawkTenantInvestigation -WhatIf
 
         Shows what investigation steps would be performed without actually executing them.
@@ -99,36 +113,166 @@
         [int]$DaysToLookBack,
         [string]$FilePath,
         [switch]$SkipUpdate,
-		[Parameter(Mandatory = $false)]
-		[string]$AzureAppCsvPath,
-		
-		[Parameter(Mandatory = $false)]  
-		[string]$AzureAppClientName,
-		
-		[Parameter(Mandatory = $false)]
-		[switch]$UseAzureApp
+        [Parameter(Mandatory = $false)]
+        [string]$AzureAppCsvPath,
+        [Parameter(Mandatory = $false)]  
+        [string]$AzureAppClientName,
+        [Parameter(Mandatory = $false)]
+        [switch]$UseAzureApp
     )
 
-
-	
     begin {
-
- 		# Check if Azure App parameters are provided
-		if ($UseAzureApp -or $AzureAppCsvPath -or $AzureAppClientName) {
-		    Write-Output "[HAWK] Azure App authentication detected, initializing..."
-		    
-		    $initParams = @{
-		        UseAzureApp = $true
-		    }
-		    
-		    if ($AzureAppCsvPath) { $initParams.AzureAppCsvPath = $AzureAppCsvPath }
-		    if ($AzureAppClientName) { $initParams.AzureAppClientName = $AzureAppClientName }
-		    if ($NonInteractive) { $initParams.HeadlessMode = $true }
-		    
-		    Initialize-HawkGlobalObject @initParams
-		}
-  
         $NonInteractive = Test-HawkNonInteractiveMode -PSBoundParameters $PSBoundParameters
+
+        # Handle Azure App authentication AFTER $NonInteractive is defined
+        $azureAppUsed = $false
+        if ($UseAzureApp -or $AzureAppCsvPath -or $AzureAppClientName) {
+            Write-Output "[HAWK] Azure App authentication detected, initializing..."
+            
+            try {
+                # Validate CSV path
+                if ([string]::IsNullOrEmpty($AzureAppCsvPath)) {
+                    throw "AzureAppCsvPath is required when using Azure App authentication"
+                }
+                
+                if (-not (Test-Path $AzureAppCsvPath)) {
+                    throw "Azure App CSV file not found: $AzureAppCsvPath"
+                }
+                
+                if ([string]::IsNullOrEmpty($AzureAppClientName)) {
+                    throw "AzureAppClientName is required when using Azure App authentication"
+                }
+                
+                # Import and validate CSV
+                $azureApps = Import-Csv -Path $AzureAppCsvPath
+                $requiredColumns = @('Client', 'Tenant ID', 'Client ID', 'Key Value', 'Expiry')
+                
+                if ($azureApps.Count -eq 0) {
+                    throw "CSV file is empty"
+                }
+                
+                $csvColumns = $azureApps[0].PSObject.Properties.Name
+                foreach ($column in $requiredColumns) {
+                    if ($column -notin $csvColumns) {
+                        throw "Missing required column: $column"
+                    }
+                }
+                
+                # Find the specified client
+                $selectedApp = $azureApps | Where-Object { $_.Client -eq $AzureAppClientName }
+                if (-not $selectedApp) {
+                    throw "Client '$AzureAppClientName' not found in CSV. Available clients: $($azureApps.Client -join ', ')"
+                }
+                
+                Write-Output "[HAWK] Connecting with Azure App: $AzureAppClientName"
+                Write-Output "[HAWK] Tenant ID: $($selectedApp.'Tenant ID')"
+                
+                # Clean up existing connections
+                try {
+                    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+                    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+                } catch {
+                    # Ignore cleanup errors
+                }
+                
+                # Create secure credential for Microsoft Graph
+                $secureClientSecret = ConvertTo-SecureString -String $selectedApp.'Key Value' -AsPlainText -Force
+                $clientSecretCredential = New-Object System.Management.Automation.PSCredential($selectedApp.'Client ID', $secureClientSecret)
+                
+                # Connect to Microsoft Graph
+                Write-Output "[HAWK] Connecting to Microsoft Graph..."
+                Connect-MgGraph -TenantId $selectedApp.'Tenant ID' -ClientSecretCredential $clientSecretCredential -NoWelcome
+                
+                # Verify Graph connection
+                $context = Get-MgContext
+                if ($context) {
+                    Write-Output "[HAWK] Microsoft Graph connected successfully"
+                    Write-Output "[HAWK]   Account: $($context.Account)"
+                } else {
+                    throw "Microsoft Graph connection failed"
+                }
+                
+                # Connect to Exchange Online with client secret (headless)
+                Write-Output "[HAWK] Connecting to Exchange Online with client secret..."
+                try {
+                    # Determine the correct organization domain
+                    $organizationDomain = $selectedApp.'Tenant ID'
+                    
+                    # Try to get the primary domain from Graph if possible
+                    try {
+                        $domains = Get-MgDomain -Filter "isInitial eq true"
+                        if ($domains -and $domains.Id) {
+                            $organizationDomain = $domains[0].Id
+                        }
+                    } catch {
+                        # Fallback to using tenant ID
+                        Write-Warning "[HAWK] Could not determine primary domain, using tenant ID"
+                    }
+                    
+                    # Connect to Exchange Online using client secret
+                    Connect-ExchangeOnline -AppId $selectedApp.'Client ID' -Organization $organizationDomain -ClientSecretCredential $clientSecretCredential -ShowProgress:$false -ShowBanner:$false -SkipLoadingFormatData:$true
+                    
+                    # Verify Exchange Online connection
+                    $exoConnectionInfo = Get-ConnectionInformation
+                    if ($exoConnectionInfo) {
+                        Write-Output "[HAWK] Exchange Online connected successfully"
+                        Write-Output "[HAWK]   Organization: $($exoConnectionInfo.Organization)"
+                        Write-Output "[HAWK]   Auth Type: $($exoConnectionInfo.AuthenticationType)"
+                    } else {
+                        throw "Exchange Online connection verification failed"
+                    }
+                    
+                } catch {
+                    Write-Warning "[HAWK] Exchange Online connection failed: $($_.Exception.Message)"
+                    Write-Output "[HAWK] Continuing with Microsoft Graph only (some data may be limited)..."
+                }
+                
+                Write-Output "[HAWK] Azure App authentication completed successfully"
+                $azureAppUsed = $true
+                
+                # Set up Hawk global object manually since we're bypassing Initialize-HawkGlobalObject
+                if (-not $Global:Hawk) {
+                    $Global:Hawk = @{}
+                }
+                
+                # Set output path
+                if ($FilePath) {
+                    if (-not (Test-Path $FilePath)) {
+                        New-Item -Path $FilePath -ItemType Directory -Force | Out-Null
+                    }
+                    $Global:Hawk.FilePath = $FilePath
+                } else {
+                    $Global:Hawk.FilePath = "C:\HawkOutput"
+                    if (-not (Test-Path $Global:Hawk.FilePath)) {
+                        New-Item -Path $Global:Hawk.FilePath -ItemType Directory -Force | Out-Null
+                    }
+                }
+                
+                # Set date range
+                if ($DaysToLookBack) {
+                    $Global:Hawk.EndDate = Get-Date
+                    $Global:Hawk.StartDate = $Global:Hawk.EndDate.AddDays(-$DaysToLookBack)
+                } elseif ($StartDate -and $EndDate) {
+                    $Global:Hawk.StartDate = $StartDate
+                    $Global:Hawk.EndDate = $EndDate
+                } else {
+                    $Global:Hawk.EndDate = Get-Date
+                    $Global:Hawk.StartDate = $Global:Hawk.EndDate.AddDays(-7)
+                }
+                
+                # Set additional global variables that Hawk functions expect
+                $Global:Hawk.TenantId = $selectedApp.'Tenant ID'
+                $Global:Hawk.ClientId = $selectedApp.'Client ID'
+                $Global:Hawk.AzureAppMode = $true
+                
+                Write-Output "[HAWK] Investigation period: $($Global:Hawk.StartDate.ToString('yyyy-MM-dd')) to $($Global:Hawk.EndDate.ToString('yyyy-MM-dd'))"
+                Write-Output "[HAWK] Output directory: $($Global:Hawk.FilePath)"
+                
+            } catch {
+                Stop-PSFFunction -Message "Azure App authentication failed: $_" -EnableException $true
+                return
+            }
+        }
 
         if ($NonInteractive) {
             $processedDates = Test-HawkDateParameter -PSBoundParameters $PSBoundParameters -StartDate $StartDate -EndDate $EndDate -DaysToLookBack $DaysToLookBack
@@ -136,9 +280,7 @@
             $EndDate = $processedDates.EndDate
     
             # Now call validation with updated StartDate/EndDate
-            $validation = Test-HawkInvestigationParameter `
-                -StartDate $StartDate -EndDate $EndDate `
-                -DaysToLookBack $DaysToLookBack -FilePath $FilePath -NonInteractive
+            $validation = Test-HawkInvestigationParameter -StartDate $StartDate -EndDate $EndDate -DaysToLookBack $DaysToLookBack -FilePath $FilePath -NonInteractive
     
             if (-not $validation.IsValid) {
                 foreach ($error in $validation.ErrorMessages) {
@@ -147,9 +289,14 @@
             }
 
             try {
-                Initialize-HawkGlobalObject -StartDate $StartDate -EndDate $EndDate `
-                    -DaysToLookBack $DaysToLookBack -FilePath $FilePath `
-                    -SkipUpdate:$SkipUpdate -NonInteractive:$NonInteractive
+                # Only run Initialize-HawkGlobalObject if Azure App was NOT used
+                if (-not $azureAppUsed) {
+                    if ($FilePath) {
+                        Initialize-HawkGlobalObject -FilePath $FilePath
+                    } else {
+                        Initialize-HawkGlobalObject
+                    }
+                }
             }
             catch {
                 Stop-PSFFunction -Message "Failed to initialize Hawk: $_" -EnableException $true
@@ -158,11 +305,10 @@
     }
 
     process {
-
         if (Test-PSFFunctionInterrupt) { return }
 
-        # Check if Hawk object exists and is fully initialized
-        if (Test-HawkGlobalObject) {
+        # Check if Hawk object exists and is fully initialized (skip if Azure App was used)
+        if (-not $azureAppUsed -and (Test-HawkGlobalObject)) {
             Initialize-HawkGlobalObject
         }
         $investigationStartTime = Get-Date
@@ -283,13 +429,11 @@
             Out-LogFile "Running Get-HawkTenantEntraIDUser." -action
             Get-HawkTenantEntraIDUser
         }
-
     }
+    
     end {
         # Calculate end time and display summary
         $investigationEndTime = Get-Date
         Write-HawkInvestigationSummary -StartTime $investigationStartTime -EndTime $investigationEndTime -InvestigationType 'Tenant'
     }
-
- 
 }
